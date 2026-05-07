@@ -80,6 +80,7 @@ RBAC_DENIAL_MESSAGE = (
 
 FOLLOWUP_SUGGESTION_TIMEOUT_SECONDS = 2.5
 FOLLOWUP_SUGGESTION_LIMIT = 3
+ENABLE_FOLLOWUP_SUGGESTIONS = os.getenv("ENABLE_FOLLOWUP_SUGGESTIONS", "false").lower() in {"1", "true", "yes"}
 
 
 def _collect_followup_topic_catalog(driver: Driver, user_tier: int, limit: int = 12) -> str:
@@ -1528,7 +1529,7 @@ def chat(request: ChatRequest) -> ChatResponse:
         )
 
     followup_suggestions: List[str] = []
-    if classification_tier == "no_match":
+    if ENABLE_FOLLOWUP_SUGGESTIONS and classification_tier == "no_match":
         try:
             followup_suggestions = _build_followup_suggestions(
                 driver,
