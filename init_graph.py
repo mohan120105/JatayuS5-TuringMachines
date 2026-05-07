@@ -433,6 +433,7 @@ def build_embeddings_model() -> Any:
     if not hf_token:
         raise ValueError("HF_TOKEN is not set. Export it or set HF_EMBEDDING_LOCAL=true.")
 
+<<<<<<< HEAD
     # Support both older and newer constructor signatures.
     try:
         from langchain_community.embeddings import HuggingFaceInferenceAPIEmbeddings
@@ -455,6 +456,51 @@ def build_embeddings_model() -> Any:
             huggingfacehub_api_token=hf_token,
             model_name=model_name,
         )
+=======
+    # Prefer the langchain_community HF inference client when available;
+    # otherwise fall back to a tiny remote-backed wrapper that calls the
+    # Hugging Face Inference embeddings endpoint directly. This avoids loading
+    # large local transformer weights into process memory on constrained hosts.
+    try:
+        from langchain_community.embeddings import HuggingFaceInferenceAPIEmbeddings
+        try:
+            return HuggingFaceInferenceAPIEmbeddings(api_key=hf_token, model_name=model_name)
+        except TypeError:
+            return HuggingFaceInferenceAPIEmbeddings(huggingfacehub_api_token=hf_token, model_name=model_name)
+    except Exception:
+        class _HFInferenceWrapper:
+            def __init__(self, model_name: str, hf_token: str, base_url: str = "https://api-inference.huggingface.co"):
+                self.model_name = model_name
+                self.api_url = f"{base_url.rstrip('/')}/embeddings/{model_name}"
+                self.headers = {"Authorization": f"Bearer {hf_token}", "Content-Type": "application/json"}
+
+            def embed_query(self, text: str):
+                import requests
+
+                payload = {"inputs": text}
+                resp = requests.post(self.api_url, headers=self.headers, json=payload, timeout=30)
+                resp.raise_for_status()
+                data = resp.json()
+                if isinstance(data, dict):
+                    if "embeddings" in data:
+                        return data["embeddings"]
+                    if "embedding" in data:
+                        return data["embedding"]
+                    if "data" in data and isinstance(data["data"], list) and data["data"]:
+                        first = data["data"][0]
+                        if isinstance(first, dict) and "embedding" in first:
+                            return first["embedding"]
+                if isinstance(data, list) and data:
+                    first = data[0]
+                    if isinstance(first, dict) and "embedding" in first:
+                        return first["embedding"]
+                    if isinstance(first, list):
+                        return first
+                raise ValueError(f"Unexpected HF embeddings response: {data}")
+
+        print("langchain_community not available; using lightweight HF Inference wrapper (remote).")
+        return _HFInferenceWrapper(model_name, hf_token)
+>>>>>>> 352bff2 (fix: avoid local HF model fallback; use lightweight HF Inference wrapper (remote) to reduce memory)
 
 
 def verify_embedding_api_connectivity(embeddings_model: Any) -> None:

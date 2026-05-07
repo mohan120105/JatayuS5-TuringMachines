@@ -1,16 +1,50 @@
 """Sentinel: Retrieval and Grounded Generation Core for Active Policy Q&A.
+    try:
+        from langchain_community.embeddings import HuggingFaceInferenceAPIEmbeddings
+        try:
+            return HuggingFaceInferenceAPIEmbeddings(huggingfacehub_api_token=hf_token, model_name=model_name)
+        except TypeError:
+            return HuggingFaceInferenceAPIEmbeddings(api_key=hf_token, model_name=model_name)
+    except Exception:
+        # langchain_community may not be installed in lightweight deploys. Avoid
+        # falling back to local transformer-based models (which load large
+        # weights into process memory) unless the operator explicitly requests
+        # `HF_EMBEDDING_LOCAL=true`. Instead, provide a tiny remote-backed
+        # wrapper that calls the Hugging Face Inference embeddings endpoint
+        # over HTTP using the provided `HF_TOKEN` so we don't load heavy libs.
+        class _HFInferenceWrapper:
+            def __init__(self, model_name: str, hf_token: str, base_url: str = "https://api-inference.huggingface.co"):
+                self.model_name = model_name
+                self.api_url = f"{base_url.rstrip('/')}/embeddings/{model_name}"
+                self.headers = {"Authorization": f"Bearer {hf_token}", "Content-Type": "application/json"}
 
-Architectural purpose:
-- Implements Sentinel retrieval logic that resolves policy evidence from Neo4j
-    and synthesizes answers only from active, governance-valid context.
-- Encapsulates enterprise fallback controls so unanswered queries fail closed
-    to strict no-answer responses instead of speculative completions.
+            def embed_query(self, text: str):
+                import requests
 
-Compliance posture:
-- Enforces Strict Retrieval Constraint by excluding superseded policy nodes.
-- Supports Stateful Auditability by returning evidence-bearing context objects
-    with normalized confidence metadata.
-- Maintains Zero-Data Egress options by using local embeddings for semantic
+                payload = {"inputs": text}
+                resp = requests.post(self.api_url, headers=self.headers, json=payload, timeout=30)
+                resp.raise_for_status()
+                data = resp.json()
+                # Accept several plausible response shapes from HF Inference.
+                if isinstance(data, dict):
+                    if "embeddings" in data:
+                        return data["embeddings"]
+                    if "embedding" in data:
+                        return data["embedding"]
+                    if "data" in data and isinstance(data["data"], list) and data["data"]:
+                        first = data["data"][0]
+                        if isinstance(first, dict) and "embedding" in first:
+                            return first["embedding"]
+                if isinstance(data, list) and data:
+                    first = data[0]
+                    if isinstance(first, dict) and "embedding" in first:
+                        return first["embedding"]
+                    if isinstance(first, list):
+                        return first
+                raise ValueError(f"Unexpected HF embeddings response: {data}")
+
+        print("langchain_community not available; using lightweight HF Inference wrapper (remote).")
+        return _HFInferenceWrapper(model_name, hf_token)
     retrieval preparation.
 """
 
@@ -332,6 +366,7 @@ def build_embeddings_model():
 
     try:
         from langchain_community.embeddings import HuggingFaceInferenceAPIEmbeddings
+<<<<<<< HEAD
     except ModuleNotFoundError:
         from langchain_huggingface import HuggingFaceEmbeddings
 
@@ -342,6 +377,52 @@ def build_embeddings_model():
         return HuggingFaceInferenceAPIEmbeddings(huggingfacehub_api_token=hf_token, model_name=model_name)
     except TypeError:
         return HuggingFaceInferenceAPIEmbeddings(api_key=hf_token, model_name=model_name)
+=======
+        try:
+            return HuggingFaceInferenceAPIEmbeddings(huggingfacehub_api_token=hf_token, model_name=model_name)
+        except TypeError:
+            return HuggingFaceInferenceAPIEmbeddings(api_key=hf_token, model_name=model_name)
+    except Exception:
+        # langchain_community may not be installed in lightweight deploys. Avoid
+        # falling back to local transformer-based models (which load large
+        # weights into process memory) unless the operator explicitly requests
+        # `HF_EMBEDDING_LOCAL=true`. Instead, provide a tiny remote-backed
+        # wrapper that calls the Hugging Face Inference embeddings endpoint
+        # over HTTP using the provided `HF_TOKEN` so we don't load heavy libs.
+        class _HFInferenceWrapper:
+            def __init__(self, model_name: str, hf_token: str, base_url: str = "https://api-inference.huggingface.co"):
+                self.model_name = model_name
+                self.api_url = f"{base_url.rstrip('/')}/embeddings/{model_name}"
+                self.headers = {"Authorization": f"Bearer {hf_token}", "Content-Type": "application/json"}
+
+            def embed_query(self, text: str):
+                import requests
+
+                payload = {"inputs": text}
+                resp = requests.post(self.api_url, headers=self.headers, json=payload, timeout=30)
+                resp.raise_for_status()
+                data = resp.json()
+                # Accept several plausible response shapes from HF Inference.
+                if isinstance(data, dict):
+                    if "embeddings" in data:
+                        return data["embeddings"]
+                    if "embedding" in data:
+                        return data["embedding"]
+                    if "data" in data and isinstance(data["data"], list) and data["data"]:
+                        first = data["data"][0]
+                        if isinstance(first, dict) and "embedding" in first:
+                            return first["embedding"]
+                if isinstance(data, list) and data:
+                    first = data[0]
+                    if isinstance(first, dict) and "embedding" in first:
+                        return first["embedding"]
+                    if isinstance(first, list):
+                        return first
+                raise ValueError(f"Unexpected HF embeddings response: {data}")
+
+        print("langchain_community not available; using lightweight HF Inference wrapper (remote).")
+        return _HFInferenceWrapper(model_name, hf_token)
+>>>>>>> 352bff2 (fix: avoid local HF model fallback; use lightweight HF Inference wrapper (remote) to reduce memory)
 
 
 def retrieve_active_policy(
