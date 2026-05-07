@@ -348,14 +348,34 @@ function MessageBubble({ message, index, onAskSME }) {
 
         <CitationsPanel citations={message.citations} />
         <CitationMap graph={message.graph} />
-        <button
-          type="button"
-          onClick={() => onAskSME?.(message, index)}
-          className="text-xs text-gray-400 hover:text-blue-400 flex items-center gap-1 mt-2 cursor-pointer transition-colors"
-        >
-          <Mail size={12} />
-          <span>Ask SME for Clarity</span>
-        </button>
+            {Array.isArray(message.followup_suggestions) && message.followup_suggestions.length > 0 ? (
+              <div className="mt-3 rounded-2xl border border-blue-700/40 bg-blue-950/30 px-3 py-3">
+                <p className="text-[11px] uppercase tracking-[0.24em] text-blue-300">
+                  Validated follow-ups
+                </p>
+                <p className="mt-1 text-xs text-blue-100/70">
+                  These questions were checked against active policies before showing them.
+                </p>
+                <div className="mt-2 space-y-2">
+                  {message.followup_suggestions.map((suggestion, idx) => (
+                    <div
+                      key={`${suggestion}-${idx}`}
+                      className="rounded-xl border border-blue-800/40 bg-gray-950/40 px-3 py-2 text-xs text-blue-50"
+                    >
+                      {suggestion}
+                    </div>
+                  ))}
+                </div>
+              </div>
+            ) : null}
+            <button
+              type="button"
+              onClick={() => onAskSME?.(message, index)}
+              className="text-xs text-gray-400 hover:text-blue-400 flex items-center gap-1 mt-2 cursor-pointer transition-colors"
+            >
+              <Mail size={12} />
+              <span>Ask SME for Clarity</span>
+            </button>
       </div>
     </div>
   )
@@ -851,6 +871,7 @@ export default function App() {
           citations: data.citations ?? [],
           graph: normalizeGraphPayload(data),
           retrieval_tier: normalizeRetrievalTier(data),
+          followup_suggestions: Array.isArray(data.followup_suggestions) ? data.followup_suggestions : [],
         }
         setMessages((prev) => [...prev, assistantMsg])
 
