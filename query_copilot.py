@@ -22,7 +22,6 @@ from typing import List, Sequence
 from dotenv import find_dotenv, load_dotenv
 from typing import Optional
 from langchain_core.prompts import PromptTemplate
-from langchain_huggingface import HuggingFaceEndpointEmbeddings
 from langchain_groq import ChatGroq
 from neo4j import Driver
 from neo4j.exceptions import Neo4jError, ServiceUnavailable
@@ -30,21 +29,6 @@ import requests
 from pydantic import BaseModel, Field
 
 from connect import build_neo4j_driver as _build_neo4j_driver_from_connect
-
-# --- Language detection: prefer FastText lid.176.bin, fallback to langdetect ---
-try:
-    import fasttext as _fasttext  # type: ignore
-    _FASTTEXT_AVAILABLE = True
-except ImportError:
-    _fasttext = None  # type: ignore
-    _FASTTEXT_AVAILABLE = False
-
-try:
-    from langdetect import detect as _langdetect_detect  # type: ignore
-    _LANGDETECT_AVAILABLE = True
-except ImportError:
-    _langdetect_detect = None  # type: ignore
-    _LANGDETECT_AVAILABLE = False
 
 import pathlib
 
@@ -123,7 +107,12 @@ def ensure_fasttext_model() -> str | None:
         return _FASTTEXT_MODEL
 
     model_path = _find_fasttext_model()
-    if model_path and _FASTTEXT_AVAILABLE and _fasttext is not None:
+    try:
+        import fasttext as _fasttext  # type: ignore
+    except ImportError:
+        return None
+
+    if model_path:
         try:
             _FASTTEXT_MODEL = _fasttext.load_model(model_path)  # type: ignore
             return model_path
@@ -196,22 +185,23 @@ def detect_user_language(text: str) -> str:
 
     # 1) FastText path
     try:
-        if _FASTTEXT_AVAILABLE and _fasttext is not None:
-            model_path = ensure_fasttext_model()
-            if model_path and _FASTTEXT_MODEL is not None:
-                labels, probs = _FASTTEXT_MODEL.predict(text, k=1)  # type: ignore
-                if labels and probs:
-                    code = labels[0].replace("__label__", "")
-                    confidence = float(probs[0])
-                    if confidence >= 0.50:
-                        return LANG_CODE_TO_NAME.get(code, code)
-                    # low confidence -> fall through to fallback
+        model_path = ensure_fasttext_model()
+        if model_path and _FASTTEXT_MODEL is not None:
+            labels, probs = _FASTTEXT_MODEL.predict(text, k=1)  # type: ignore
+            if labels and probs:
+                code = labels[0].replace("__label__", "")
+                confidence = float(probs[0])
+                if confidence >= 0.50:
+                    return LANG_CODE_TO_NAME.get(code, code)
+                # low confidence -> fall through to fallback
     except Exception:
         pass
 
     # 2) langdetect fallback
     try:
-        if _LANGDETECT_AVAILABLE and _langdetect_detect is not None:
+        from langdetect import detect as _langdetect_detect  # type: ignore
+
+        if _langdetect_detect is not None:
             code = _langdetect_detect(text)  # type: ignore
             return LANG_CODE_TO_NAME.get(code, code)
     except Exception:
@@ -317,7 +307,7 @@ def build_groq_llm() -> ChatGroq:
     return ChatGroq(model="llama-3.3-70b-versatile", temperature=0, api_key=api_key)
 
 
-def build_embeddings_model() -> HuggingFaceEndpointEmbeddings:
+def build_embeddings_model():
     """Build cloud-hosted sentence-transformer embeddings client.
 
     Returns:
