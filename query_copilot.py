@@ -20,11 +20,23 @@
 
             def embed_query(self, text: str):
                 import requests
+                import time
 
                 payload = {"inputs": text}
-                resp = requests.post(self.api_url, headers=self.headers, json=payload, timeout=30)
-                resp.raise_for_status()
-                data = resp.json()
+                last_exc = None
+                for attempt in range(3):
+                    try:
+                        resp = requests.post(self.api_url, headers=self.headers, json=payload, timeout=15)
+                        resp.raise_for_status()
+                        data = resp.json()
+                        break
+                    except Exception as exc:
+                        last_exc = exc
+                        print(f"[WARNING] HF embeddings request attempt {attempt+1} failed: {exc}")
+                        if attempt < 2:
+                            time.sleep(1 + attempt * 2)
+                            continue
+                        raise RuntimeError(f"Hugging Face embeddings request failed after retries: {exc}")
                 # Accept several plausible response shapes from HF Inference.
                 if isinstance(data, dict):
                     if "embeddings" in data:
