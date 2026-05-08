@@ -229,7 +229,7 @@ def _validate_followup_suggestion(
             question_embedding,
             top_k=3,
             user_tier=user_tier,
-            similarity_threshold=0.5,
+            similarity_threshold=0.3,
         )
     except Exception as exc:
         print(f"[WARNING] Follow-up validation failed for '{normalized_suggestion}': {exc}")
