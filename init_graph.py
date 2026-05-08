@@ -421,11 +421,32 @@ def build_embeddings_model() -> Any:
     space_name = os.getenv("HF_EMBEDDING_SPACE", "mohan1201/sentinel-embedding-server")
     client = Client(space_name)
 
-    # Default to 'embed' endpoint; override via HF_EMBEDDING_API_NAME env var if needed
-    api_name = os.getenv("HF_EMBEDDING_API_NAME", "embed").lstrip('/')
+    # Default to '/embed' endpoint; allow override via HF_EMBEDDING_API_NAME.
+    configured_api_name = os.getenv("HF_EMBEDDING_API_NAME", "/embed").strip()
 
     def get_embedding(text: str):
-        return client.predict(text, api_name=api_name)
+        api_candidates = []
+        if configured_api_name:
+            api_candidates.append(configured_api_name)
+            if configured_api_name.startswith("/"):
+                api_candidates.append(configured_api_name.lstrip("/"))
+            else:
+                api_candidates.append(f"/{configured_api_name}")
+
+        # Deduplicate while preserving order.
+        seen = set()
+        unique_candidates = [name for name in api_candidates if not (name in seen or seen.add(name))]
+
+        last_error: Exception | None = None
+        for candidate in unique_candidates:
+            try:
+                return client.predict(text, api_name=candidate)
+            except Exception as exc:
+                last_error = exc
+
+        if last_error is not None:
+            raise last_error
+        return client.predict(text)
 
     class _GradioSpaceEmbeddings:
         def embed_query(self, text: str):
