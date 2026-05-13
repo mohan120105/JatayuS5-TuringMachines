@@ -87,6 +87,8 @@ ENABLE_FOLLOWUP_SUGGESTIONS = os.getenv("ENABLE_FOLLOWUP_SUGGESTIONS", "false").
 
 GITHUB_API_BASE = "https://api.github.com"
 GITHUB_REPO = os.getenv("GITHUB_REPO", "").strip()
+GITHUB_POLICY_MANIFEST_REPO = os.getenv("GITHUB_POLICY_MANIFEST_REPO", GITHUB_REPO).strip()
+GITHUB_POLICY_CONTENTS_REPO = os.getenv("GITHUB_POLICY_CONTENTS_REPO", GITHUB_REPO).strip()
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "").strip()
 GITHUB_DOCS_ROOT = os.getenv("GITHUB_DOCS_ROOT", "hackathon-docs").strip().strip("/")
 GITHUB_POLICY_MANIFEST_PATH = os.getenv(
@@ -563,10 +565,13 @@ def _build_evidence_graph(
 
 
 def _validate_github_config() -> None:
-    if not GITHUB_REPO or not GITHUB_TOKEN:
+    if not GITHUB_POLICY_MANIFEST_REPO or not GITHUB_POLICY_CONTENTS_REPO or not GITHUB_TOKEN:
         raise HTTPException(
             status_code=500,
-            detail="GitHub policy proxy is not configured. Set GITHUB_REPO and GITHUB_TOKEN.",
+            detail=(
+                "GitHub policy proxy is not configured. Set GITHUB_POLICY_MANIFEST_REPO, "
+                "GITHUB_POLICY_CONTENTS_REPO, and GITHUB_TOKEN."
+            ),
         )
 
 
@@ -608,9 +613,9 @@ def _is_file_authorized(user_tier: int, required_access_code: int) -> bool:
     return user_tier == 1 or required_access_code == 2
 
 
-def _fetch_github_contents_json(repo_path: str) -> Dict[str, Any]:
+def _fetch_github_contents_json(repo_path: str, *, repo: str) -> Dict[str, Any]:
     _validate_github_config()
-    url = f"{GITHUB_API_BASE}/repos/{GITHUB_REPO}/contents/{repo_path.lstrip('/')}"
+    url = f"{GITHUB_API_BASE}/repos/{repo}/contents/{repo_path.lstrip('/')}"
     try:
         response = requests.get(url, headers=_github_headers(), timeout=20)
     except requests.RequestException as exc:
@@ -631,7 +636,7 @@ def _fetch_github_contents_json(repo_path: str) -> Dict[str, Any]:
 
 
 def _fetch_github_text_file(repo_path: str) -> str:
-    metadata = _fetch_github_contents_json(repo_path)
+    metadata = _fetch_github_contents_json(repo_path, repo=GITHUB_POLICY_MANIFEST_REPO)
     encoded = metadata.get("content")
     if not isinstance(encoded, str):
         raise HTTPException(status_code=500, detail="Manifest content is missing.")
@@ -725,7 +730,7 @@ def _resolve_policy_record(file_name: str) -> Dict[str, Any]:
 
 def _stream_github_file(repo_path: str) -> requests.Response:
     _validate_github_config()
-    url = f"{GITHUB_API_BASE}/repos/{GITHUB_REPO}/contents/{repo_path.lstrip('/')}"
+    url = f"{GITHUB_API_BASE}/repos/{GITHUB_POLICY_CONTENTS_REPO}/contents/{repo_path.lstrip('/')}"
     try:
         response = requests.get(
             url,
