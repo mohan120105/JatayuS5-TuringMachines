@@ -27,7 +27,9 @@ CATEGORY_VALUES: tuple[str, ...] = (
     "Risk_Management", "Priority_Sector_Lending", "Audit_And_Inspection",
 )
 
-# Embedding dimensionality for paraphrase-multilingual-MiniLM-L12-v2
+# Embedding dimensionality for e5-small multilingual embeddings
+# Model: intfloat/multilingual-e5-small (384-dim vector space)
+# Deployed on HF Spaces: mohan1201/sentinel-embedding-server
 EMBEDDING_DIM = 384
 
 TargetCategory = Literal[

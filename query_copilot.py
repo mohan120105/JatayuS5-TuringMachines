@@ -96,7 +96,8 @@ STRICT_NO_ANSWER = (
     "I cannot find a verified active policy for this in the current database."
 )
 
-# Embedding dimensionality expected from the multilingual MiniLM paraphrase model (384)
+# Embedding dimensionality expected from e5-small multilingual embeddings (384-dim)
+# Model: intfloat/multilingual-e5-small deployed on HF Spaces (mohan1201/sentinel-embedding-server)
 EMBEDDING_DIM = 384
 
 
