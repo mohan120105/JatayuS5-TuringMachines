@@ -91,7 +91,7 @@ GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "").strip()
 GITHUB_DOCS_ROOT = os.getenv("GITHUB_DOCS_ROOT", "hackathon-docs").strip().strip("/")
 GITHUB_POLICY_MANIFEST_PATH = os.getenv(
     "GITHUB_POLICY_MANIFEST_PATH",
-    f"{GITHUB_DOCS_ROOT}/policy_access_manifest.json",
+    "policy_access_manifest.json",
 ).strip().strip("/")
 
 
@@ -651,7 +651,33 @@ def _coerce_access_code(raw_value: Any) -> int:
 
 
 def _load_policy_manifest() -> Dict[str, Dict[str, Any]]:
-    raw_text = _fetch_github_text_file(GITHUB_POLICY_MANIFEST_PATH)
+    manifest_candidates = [
+        GITHUB_POLICY_MANIFEST_PATH,
+        "policy_access_manifest.json",
+        f"{GITHUB_DOCS_ROOT}/policy_access_manifest.json" if GITHUB_DOCS_ROOT else "",
+    ]
+
+    raw_text = None
+    last_error: HTTPException | None = None
+    for manifest_path in dict.fromkeys(candidate for candidate in manifest_candidates if candidate):
+        try:
+            raw_text = _fetch_github_text_file(manifest_path)
+            break
+        except HTTPException as exc:
+            if exc.status_code == 404:
+                last_error = exc
+                continue
+            raise
+
+    if raw_text is None:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                "Policy manifest not found in the GitHub repository. "
+                "Expected policy_access_manifest.json at the repo root or under hackathon-docs/."
+            ),
+        ) from last_error
+
     try:
         payload = json.loads(raw_text)
     except json.JSONDecodeError as exc:
