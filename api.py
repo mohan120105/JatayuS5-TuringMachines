@@ -19,17 +19,19 @@ Compliance posture:
 
 from __future__ import annotations
 
+import asyncio
 from concurrent.futures import ThreadPoolExecutor, wait
 import base64
 import json
 import os
 import re
 import time
+import threading
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List
 
 from dotenv import find_dotenv, load_dotenv
-from fastapi import FastAPI, File, Form, Header, HTTPException, Query, UploadFile
+from fastapi import FastAPI, File, Form, Header, HTTPException, Query, Request, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
@@ -84,6 +86,7 @@ RBAC_DENIAL_MESSAGE = (
 FOLLOWUP_SUGGESTION_TIMEOUT_SECONDS = 2.5
 FOLLOWUP_SUGGESTION_LIMIT = 3
 ENABLE_FOLLOWUP_SUGGESTIONS = os.getenv("ENABLE_FOLLOWUP_SUGGESTIONS", "false").lower() in {"1", "true", "yes"}
+STOP_GENERATION_MESSAGE = "Generation interrupted by user."
 
 GITHUB_API_BASE = "https://api.github.com"
 GITHUB_REPO = os.getenv("GITHUB_REPO", "").strip()
@@ -192,26 +195,99 @@ def _parse_followup_suggestions(raw_text: str) -> List[str]:
     return deduped
 
 
-def _generate_followup_candidates(
+def _fallback_followup_questions(
+    user_question: str,
+    no_match: bool,
+) -> List[str]:
+    """Build deterministic fallback follow-up questions for operator guidance.
+
+    Args:
+        user_question: The original operator query used to infer a stable
+            policy topic when the model response is incomplete.
+        no_match: Indicates whether the retrieval tier produced no verified
+            policy context. When true, the fallback wording pivots to
+            clarification rather than policy expansion.
+
+    Returns:
+        List[str]: Three concise clarifying questions aligned to the current
+        retrieval state.
+
+    Audit Note:
+        Fallback questions are used only as a controlled UX aid. They do not
+        introduce evidence, and they avoid speculative policy claims so the
+        response surface remains compatible with GLAC and Stateful Auditability.
+    """
+
+    topic_terms = _extract_question_terms(user_question)
+    topic_hint = " ".join(topic_terms[:3]).strip() or "the policy"
+
+    if no_match:
+        return [
+            f"What exactly do you want to know about {topic_hint}?",
+            "Which policy area, product, or account type is this about?",
+            "What missing detail would help narrow the request?",
+        ]
+
+    return [
+        f"What is the exact eligibility rule for {topic_hint}?",
+        f"Which documents or evidence are required for {topic_hint}?",
+        f"What exceptions, thresholds, or limits apply to {topic_hint}?",
+    ]
+
+
+def _generate_single_followup_question(
     llm,
     user_question: str,
+    answer: str,
+    context_text: str,
     detected_language: str,
-    topic_catalog: str,
-) -> List[str]:
-    """Ask the LLM for answerable follow-up questions grounded in the catalog."""
+    focus: str,
+    no_match: bool,
+) -> str:
+    """Generate a single follow-up question using a narrowly scoped prompt.
 
-    system_content = (
-        f"The user's query is in {detected_language}. "
-        "You help internal bank employees rephrase a question when no direct match is found. "
-        "Use only the policy topics in the catalog. "
-        "Generate short follow-up questions that are likely answerable by the current policy graph. "
-        "Do not repeat the original question. Do not invent topics outside the catalog. "
-        "Return only a JSON array of strings and nothing else."
-    )
+    Args:
+        llm: The hosted LLM client used to synthesize the question.
+        user_question: The original question that anchors the synthesis.
+        answer: The generated answer used to keep the follow-up grounded in
+            the current turn.
+        context_text: The policy context passed to the model for grounding.
+        detected_language: The language identified for the current operator.
+        focus: The specific reasoning lens to apply for this candidate.
+        no_match: Signals that the turn has no verified policy match and the
+            follow-up must become clarifying rather than evidentiary.
+
+    Returns:
+        str: One short follow-up question, or an empty string when the model
+        output cannot be normalized safely.
+
+    Audit Note:
+        The prompt is intentionally constrained to preserve answer quality and
+        prevent speculative evidence from entering the follow-up suggestions.
+        This supports GLAC-controlled synthesis and Stateful Auditability.
+    """
+
+    if no_match:
+        system_content = (
+            f"The user's query is in {detected_language}. "
+            "The assistant could not find a verified active policy. "
+            "Generate one concise clarifying question that stays closely related to the user's original request. "
+            "Do not reference a follow-up policy search. Do not invent policy facts. Return only the question text."
+        )
+    else:
+        system_content = (
+            f"The user's query is in {detected_language}. "
+            "You are helping an analyst continue from a grounded policy answer. "
+            "Generate one concise follow-up question that is directly answerable from the current policy context. "
+            "Do not repeat the original question. Do not invent facts. Return only the question text."
+        )
+
     user_content = (
-        f"Original query: {user_question}\n\n"
-        f"Policy topic catalog:\n{topic_catalog}\n\n"
-        "Return 5 candidate follow-up questions as JSON."
+        f"Focus area: {focus}\n\n"
+        f"Original question: {user_question}\n\n"
+        f"Assistant answer: {answer}\n\n"
+        f"Policy context:\n{context_text or 'No verified context available.'}\n\n"
+        "Write exactly one question and keep it brief."
     )
 
     response = llm.invoke(
@@ -220,7 +296,98 @@ def _generate_followup_candidates(
             HumanMessage(content=user_content),
         ]
     )
-    return _parse_followup_suggestions(str(response.content))[:5]
+    candidates = _parse_followup_suggestions(str(response.content))
+    return candidates[0] if candidates else ""
+
+
+def _generate_followup_candidates(
+    llm,
+    user_question: str,
+    answer: str,
+    context_text: str,
+    detected_language: str,
+    no_match: bool,
+) -> List[str]:
+    """Generate exactly three follow-up questions under a strict time budget.
+
+    Args:
+        llm: The hosted LLM client used to synthesize each candidate.
+        user_question: The original operator query that anchors the turn.
+        answer: The current grounded answer, used to keep follow-ups relevant.
+        context_text: The verified policy context associated with the turn.
+        detected_language: The language detected for the operator request.
+        no_match: Indicates that the turn has no verified policy match and the
+            follow-up strategy must shift from expansion to clarification.
+
+    Returns:
+        List[str]: Up to three normalized follow-up questions, validated for
+        relevance and deduplicated.
+
+    Audit Note:
+        ThreadPoolExecutor is used to keep follow-up synthesis inside a bounded
+        2.5-second service budget. This preserves p95 latency targets while
+        avoiding unbounded background work that could create zombie tasks or
+        memory pressure under concurrent load.
+    """
+
+    focus_items = [
+        "eligibility and applicability",
+        "required documents or evidence",
+        "numeric limits, thresholds, or exceptions",
+    ]
+
+    if no_match:
+        focus_items = [
+            "the policy area or rule family",
+            "the customer, account, or product type",
+            "the missing detail needed to narrow the request",
+        ]
+
+    # SECURITY GUARDRAIL: Parallelize only three bounded synthesis tasks so the
+    # request cannot fan out into uncontrolled model work or background leakage.
+    executor = ThreadPoolExecutor(max_workers=FOLLOWUP_SUGGESTION_LIMIT)
+    try:
+        futures = [
+            executor.submit(
+                _generate_single_followup_question,
+                llm,
+                user_question,
+                answer,
+                context_text,
+                detected_language,
+                focus,
+                no_match,
+            )
+            for focus in focus_items[:FOLLOWUP_SUGGESTION_LIMIT]
+        ]
+
+        suggestions: List[str] = []
+        seen = set()
+        for future in futures:
+            try:
+                suggestion = (future.result() or "").strip()
+            except Exception:
+                suggestion = ""
+            if not suggestion:
+                continue
+            normalized = suggestion.lower()
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            suggestions.append(suggestion)
+
+        for fallback in _fallback_followup_questions(user_question, no_match):
+            if len(suggestions) >= FOLLOWUP_SUGGESTION_LIMIT:
+                break
+            normalized = fallback.lower()
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            suggestions.append(fallback)
+
+        return suggestions[:FOLLOWUP_SUGGESTION_LIMIT]
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
 
 
 def _validate_followup_suggestion(
@@ -257,28 +424,60 @@ def _build_followup_suggestions(
     llm,
     embeddings,
     user_question: str,
+    answer: str,
+    active_context: List[ActivePolicy],
     detected_language: str,
     user_tier: int,
+    no_match: bool,
 ) -> List[str]:
     """Generate and validate answerable follow-up questions within a time budget."""
 
     start_time = time.monotonic()
     time_budget = FOLLOWUP_SUGGESTION_TIMEOUT_SECONDS
 
+    context_text = "\n\n".join(
+        [
+            (
+                f"Document: {item.document_name}\n"
+                f"Category: {item.category}\n"
+                f"Applies To: {', '.join(item.customer_types) if item.customer_types else 'None'}\n"
+                f"Requires: {', '.join(item.required_docs) if item.required_docs else 'None'}\n"
+                f"Rule: {item.extracted_rule}"
+            )
+            for item in active_context
+        ]
+    )
+
+    if no_match:
+        try:
+            return _generate_followup_candidates(
+                llm,
+                user_question,
+                answer,
+                context_text,
+                detected_language,
+                True,
+            )
+        except Exception as exc:
+            print(f"[WARNING] No-match follow-up suggestion generation failed: {exc}")
+            return _fallback_followup_questions(user_question, True)
+
     topic_catalog = _collect_followup_topic_catalog(driver, user_tier)
     if not topic_catalog:
-        return []
+        return _fallback_followup_questions(user_question, False)
 
     try:
         candidate_suggestions = _generate_followup_candidates(
             llm,
             user_question,
+            answer,
+            context_text or topic_catalog,
             detected_language,
-            topic_catalog,
+            False,
         )
     except Exception as exc:
         print(f"[WARNING] Follow-up suggestion generation failed: {exc}")
-        return []
+        return _fallback_followup_questions(user_question, False)
 
     filtered_candidates: List[str] = []
     seen = set()
@@ -301,7 +500,7 @@ def _build_followup_suggestions(
     if remaining_budget <= 0:
         return []
 
-    executor = ThreadPoolExecutor(max_workers=min(FOLLOWUP_SUGGESTION_LIMIT, len(filtered_candidates)))
+    executor = ThreadPoolExecutor(max_workers=FOLLOWUP_SUGGESTION_LIMIT)
     try:
         futures = [
             executor.submit(
@@ -323,6 +522,14 @@ def _build_followup_suggestions(
                 suggestion = None
             if suggestion and suggestion not in validated:
                 validated.append(suggestion)
+
+        if len(validated) < FOLLOWUP_SUGGESTION_LIMIT:
+            for fallback in _fallback_followup_questions(user_question, False):
+                if len(validated) >= FOLLOWUP_SUGGESTION_LIMIT:
+                    break
+                if fallback not in validated:
+                    validated.append(fallback)
+
         return validated[:FOLLOWUP_SUGGESTION_LIMIT]
     finally:
         executor.shutdown(wait=False, cancel_futures=True)
@@ -975,31 +1182,42 @@ def _save_messages_tx(
     user_tier: int | None = None,
     retrieval_tier: str | None = None,
     sentinel_reasoning: str | None = None,
+    interrupted: bool = False,
 ) -> None:
-    """Persist user and assistant messages for a completed turn.
-
-    The assistant timestamp is offset by 1 µs so ORDER BY timestamp ASC
-    always places the user turn before the assistant turn for the same round.
-    Citations are serialized to JSON for the assistant message.
+    """Persist a completed turn as session-scoped Neo4j Message nodes.
 
     Args:
-        tx: Active Neo4j managed transaction.
-        session_id: Session identifier to attach Message nodes.
+        tx: Active Neo4j managed transaction used for graph persistence.
+        session_id: Session identifier that binds the turn to Stateful
+            Auditability.
         user_question: Original end-user question text.
-        enhanced_prompt: Optional edge-enhanced version of user text.
-        answer: Assistant response content.
+        enhanced_prompt: Optional edge-enhanced query text retained for replay.
+        answer: Assistant response content to persist when the turn completes.
         citations: Optional evidence list associated with the answer.
+        user_tier: Operator access tier used to preserve session filtering.
+        retrieval_tier: Retrieval classification recorded for downstream audit.
+        sentinel_reasoning: Short explanation of the retrieval decision.
+        interrupted: Marks the assistant node as interrupted when generation is
+            stopped by the client.
 
     Returns:
-        None: Data is written as a graph side effect.
+        None: The function writes graph state only.
+
+    Audit Note:
+        Interrupted turns keep the user message but avoid serializing partial
+        evidence into the assistant node. That preserves session continuity
+        without misrepresenting incomplete model output as final policy truth.
     """
     now = datetime.now(timezone.utc)
     ts_user = now.isoformat()
     ts_asst = (now + timedelta(microseconds=1)).isoformat()
 
     citations_json = None
-    if citations:
+    if citations and not interrupted:
         citations_json = json.dumps([c.dict() for c in citations])
+
+    assistant_content = STOP_GENERATION_MESSAGE if interrupted else answer
+    assistant_status = "Interrupted" if interrupted else None
 
     tx.run(
         """
@@ -1008,18 +1226,19 @@ def _save_messages_tx(
         FOREACH (_ IN CASE WHEN $enhanced_prompt IS NOT NULL THEN [1] ELSE [] END |
             SET u.enhanced_prompt = $enhanced_prompt
         )
-        CREATE (a:Message {role: 'assistant', content: $answer,   timestamp: $ts_asst, citations: $citations_json, tier: $user_tier, retrieval_tier: $retrieval_tier, sentinel_reasoning: $sentinel_reasoning})
+        CREATE (a:Message {role: 'assistant', content: $answer,   timestamp: $ts_asst, citations: $citations_json, tier: $user_tier, retrieval_tier: $retrieval_tier, sentinel_reasoning: $sentinel_reasoning, status: $assistant_status})
         CREATE (s)-[:CONTAINS_MESSAGE]->(u)
         CREATE (s)-[:CONTAINS_MESSAGE]->(a)
         """,
         session_id=session_id,
         question=user_question,
         enhanced_prompt=enhanced_prompt,
-        answer=answer,
+        answer=assistant_content,
         citations_json=citations_json,
         user_tier=user_tier,
         retrieval_tier=retrieval_tier,
         sentinel_reasoning=sentinel_reasoning,
+        assistant_status=assistant_status,
         ts_user=ts_user,
         ts_asst=ts_asst,
     )
@@ -1460,25 +1679,36 @@ def _generate_with_history(
     history: List[Dict[str, str]],
     retrieval_tier: str | None = None,
     detected_language: str = "English",
-) -> tuple[str, str]:
-    """Generate a grounded answer using active policies and session history.
-
-    Falls back to STRICT_NO_ANSWER when active_context is empty, consistent
-    with the base generate_answer behaviour in query_copilot.py.
+    stop_event: threading.Event | None = None,
+) -> tuple[str, str, bool]:
+    """Generate a grounded response from active policy evidence and history.
 
     Args:
         llm: LLM client used for final response generation.
         active_context: Retrieved active policy evidence set.
         user_question: Current user turn.
-        history: Prior role/content messages for continuity.
-        retrieval_tier: Optional tier classification override.
-        detected_language: Detected language of user query (default: English).
+        history: Prior role/content messages retained for continuity.
+        retrieval_tier: Optional tier classification override used for audit
+            replay and downstream escalation.
+        detected_language: Detected language of the user query.
+        stop_event: Cooperative cancellation flag set when the user presses
+            Stop or disconnects from the client.
 
     Returns:
-        tuple[str, str]: Grounded assistant response and sentinel reasoning.
+        tuple[str, str, bool]: The assistant answer, sentinel reasoning, and a
+        boolean interruption flag.
+
+    Audit Note:
+        The stop event is checked before and during synthesis so cancellation
+        propagates cooperatively instead of leaving orphaned work in the event
+        loop or a live worker thread. This prevents zombie execution and keeps
+        Stateful Auditability aligned with the final persisted turn.
     """
+    if stop_event is not None and stop_event.is_set():
+        return "", STOP_GENERATION_MESSAGE, True
+
     if not active_context:
-        return STRICT_NO_ANSWER, "No verified policy context was retrieved for the question."
+        return STRICT_NO_ANSWER, "No verified policy context was retrieved for the question.", False
 
     tier, sentinel_reasoning = _classify_context_tier(user_question, active_context)
     retrieval_tier = retrieval_tier or tier
@@ -1534,8 +1764,23 @@ def _generate_with_history(
     llm_messages.append(HumanMessage(content=user_question))
 
     try:
+        stream_fn = getattr(llm, "stream", None)
+        if callable(stream_fn):
+            chunks: List[str] = []
+            for chunk in stream_fn(llm_messages):
+                if stop_event is not None and stop_event.is_set():
+                    return "".join(chunks).strip(), STOP_GENERATION_MESSAGE, True
+                chunk_text = getattr(chunk, "content", None)
+                if chunk_text:
+                    chunks.append(str(chunk_text))
+            if stop_event is not None and stop_event.is_set():
+                return "".join(chunks).strip(), STOP_GENERATION_MESSAGE, True
+            return "".join(chunks).strip(), sentinel_reasoning, False
+
         response = llm.invoke(llm_messages)
-        return str(response.content).strip(), sentinel_reasoning
+        if stop_event is not None and stop_event.is_set():
+            return str(response.content).strip(), STOP_GENERATION_MESSAGE, True
+        return str(response.content).strip(), sentinel_reasoning, False
     except Exception as exc:
         err = str(exc)
         if "429" in err or "rate" in err.lower():
@@ -1543,8 +1788,9 @@ def _generate_with_history(
                 "Groq API rate limit encountered while generating response. "
                 "Please retry in a few seconds.",
                 sentinel_reasoning,
+                False,
             )
-        return f"Failed to generate response from Groq: {exc}", sentinel_reasoning
+        return f"Failed to generate response from Groq: {exc}", sentinel_reasoning, False
 
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
@@ -1730,7 +1976,7 @@ def enhance_prompt(request: EnhanceRequest) -> EnhanceResponse:
 
 
 @app.post("/chat", response_model=ChatResponse)
-def chat(request: ChatRequest) -> ChatResponse:
+async def chat(request: Request, payload: ChatRequest) -> ChatResponse:
     """GraphRAG chat endpoint with persistent Neo4j session memory.
 
     Flow:
@@ -1741,7 +1987,8 @@ def chat(request: ChatRequest) -> ChatResponse:
     5. Return the answer and extracted citations to the client.
 
     Args:
-        request: Chat request containing session identifier and user question.
+        request: Active FastAPI request used to detect client cancellation.
+        payload: Chat request containing session identifier and user question.
 
     Returns:
         ChatResponse: Grounded answer plus citation set for client evidence UI.
@@ -1750,9 +1997,20 @@ def chat(request: ChatRequest) -> ChatResponse:
         HTTPException: If request validation fails or session operations cannot
             access Neo4j.
     """
-    session_id = request.session_id.strip()
-    user_question = request.user_question.strip()
-    employee_id = request.employee_id.strip()
+    stop_event = threading.Event()
+
+    async def _watch_disconnect() -> None:
+        while not stop_event.is_set():
+            if await request.is_disconnected():
+                stop_event.set()
+                return
+            await asyncio.sleep(0.1)
+
+    disconnect_task = asyncio.create_task(_watch_disconnect())
+
+    session_id = payload.session_id.strip()
+    user_question = payload.user_question.strip()
+    employee_id = payload.employee_id.strip()
 
     if not session_id:
         raise HTTPException(status_code=422, detail="session_id must not be empty.")
@@ -1767,113 +2025,157 @@ def chat(request: ChatRequest) -> ChatResponse:
     llm = _get_llm()
     embeddings = _get_embeddings()
 
-    # ── Step 1: Fetch (or create) session + last 4 message history ────────────
     try:
-        with driver.session() as neo4j_session:
-            history = neo4j_session.execute_write(
-                _fetch_session_history_tx, session_id
-            )
-    except (Neo4jError, ServiceUnavailable) as exc:
-        raise HTTPException(
-            status_code=503, detail=f"Neo4j session error: {exc}"
-        ) from exc
-
-    # Step 2 uses true hybrid retrieval, mathematically fusing Lucene BM25
-    # keyword relevance with cosine-similarity vector search before governance
-    # filtering for active policy truth.
-    try:
-        question_embedding = embeddings.embed_query(f"query: {user_question}")
-    except Exception as exc:
-        # Embedding failures (network, auth, model errors) should return a
-        # controlled 503 to the client rather than raising an uncaught 500.
-        raise HTTPException(
-            status_code=503,
-            detail=f"Embedding service unavailable: {exc}",
-        ) from exc
-
-    active_context = retrieve_active_policy(
-        driver,
-        user_question,
-        question_embedding,
-        user_tier=user_tier,
-    )
-
-    # ── Step 3: Generate answer with retrieved context + conversation history ──
-    retrieval_tier, sentinel_reasoning = _classify_context_tier(user_question, active_context)
-    classification_tier = retrieval_tier
-
-    # Detect user's language for multilingual response
-    detected_language = detect_user_language(user_question)
-
-    if user_tier != 1 and not active_context:
-        answer = RBAC_DENIAL_MESSAGE
-        sentinel_reasoning = RBAC_DENIAL_MESSAGE
-        retrieval_tier = "access_denied"
-    else:
-        answer, sentinel_reasoning = _generate_with_history(
-            llm,
-            active_context,
-            user_question,
-            history,
-            retrieval_tier=retrieval_tier,
-            detected_language=detected_language,
-        )
-
-    followup_suggestions: List[str] = []
-    if ENABLE_FOLLOWUP_SUGGESTIONS and classification_tier == "no_match":
+        # COMPLIANCE CRITICAL: Start a disconnect watcher immediately so a user
+        # Stop action or browser disconnect can cancel generation before it
+        # persists speculative output or leaves a worker thread running.
         try:
-            followup_suggestions = _build_followup_suggestions(
+            with driver.session() as neo4j_session:
+                history = neo4j_session.execute_write(
+                    _fetch_session_history_tx, session_id
+                )
+        except (Neo4jError, ServiceUnavailable) as exc:
+            raise HTTPException(
+                status_code=503, detail=f"Neo4j session error: {exc}"
+            ) from exc
+
+        if stop_event.is_set() or await request.is_disconnected():
+            stop_event.set()
+            interrupted = True
+            answer = STOP_GENERATION_MESSAGE
+            retrieval_tier = "interrupted"
+            sentinel_reasoning = STOP_GENERATION_MESSAGE
+            active_context = []
+            citations = []
+            graph_nodes = []
+            graph_edges = []
+            followup_suggestions = []
+        else:
+            # COMPLIANCE CRITICAL: Retrieval must stay fully grounded before any
+            # response is emitted. The hybrid search path combines lexical and
+            # vector evidence, then applies GLAC and policy access filtering.
+            try:
+                question_embedding = embeddings.embed_query(f"query: {user_question}")
+            except Exception as exc:
+                # Embedding failures (network, auth, model errors) should return a
+                # controlled 503 to the client rather than raising an uncaught 500.
+                raise HTTPException(
+                    status_code=503,
+                    detail=f"Embedding service unavailable: {exc}",
+                ) from exc
+
+            active_context = retrieve_active_policy(
                 driver,
-                llm,
-                embeddings,
                 user_question,
-                detected_language,
-                user_tier,
+                question_embedding,
+                user_tier=user_tier,
             )
-        except Exception as exc:
-            print(f"[WARNING] Follow-up suggestion path failed safely: {exc}")
 
-    # ── Step 4: Build citation list for the client ─────────────────────────────
-    citations = [
-        Citation(
-            document_name=p.document_name,
-            category=p.category,
-            raw_score=float(p.score),
+            # SECURITY GUARDRAIL: The answer generator is invoked only after the
+            # retrieval tier is known, so the turn can be treated as no-match,
+            # partial, exact, or interrupted in a deterministic way.
+            retrieval_tier, sentinel_reasoning = _classify_context_tier(user_question, active_context)
+            classification_tier = retrieval_tier
+
+            # Detect the operator language early so both synthesis and follow-up
+            # guidance remain aligned to the same multilingual audit trail.
+            detected_language = detect_user_language(user_question)
+
+            if user_tier != 1 and not active_context:
+                answer = RBAC_DENIAL_MESSAGE
+                sentinel_reasoning = RBAC_DENIAL_MESSAGE
+                retrieval_tier = "access_denied"
+                interrupted = False
+            else:
+                answer, sentinel_reasoning, interrupted = await run_in_threadpool(
+                    _generate_with_history,
+                    llm,
+                    active_context,
+                    user_question,
+                    history,
+                    retrieval_tier,
+                    detected_language,
+                    stop_event,
+                )
+
+            if stop_event.is_set() or interrupted:
+                retrieval_tier = "interrupted"
+                answer = STOP_GENERATION_MESSAGE
+                sentinel_reasoning = STOP_GENERATION_MESSAGE
+
+            followup_suggestions = []
+            if ENABLE_FOLLOWUP_SUGGESTIONS and classification_tier == "no_match" and not stop_event.is_set():
+                try:
+                    followup_suggestions = _build_followup_suggestions(
+                        driver,
+                        llm,
+                        embeddings,
+                        user_question,
+                        answer,
+                        active_context,
+                        detected_language,
+                        user_tier,
+                        True,
+                    )
+                except Exception as exc:
+                    print(f"[WARNING] Follow-up suggestion path failed safely: {exc}")
+
+            # COMPLIANCE CRITICAL: No-match, denied, or interrupted turns must
+            # not expose evidence objects. Empty citations prevent speculative
+            # evidence from being rendered as if it were verified policy truth.
+            if retrieval_tier in {"no_match", "access_denied", "interrupted"} or not active_context or answer == STRICT_NO_ANSWER:
+                citations = []
+                graph_nodes = []
+                graph_edges = []
+            else:
+                citations = [
+                    Citation(
+                        document_name=p.document_name,
+                        category=p.category,
+                        raw_score=float(p.score),
+                    )
+                    for p in active_context
+                ]
+                graph_nodes, graph_edges = _build_evidence_graph(active_context)
+
+            # ── Step 5: Persist the new turn to Neo4j with citations (non-fatal on failure) ──────────
+            try:
+                with driver.session() as neo4j_session:
+                    neo4j_session.execute_write(
+                        _save_messages_tx,
+                        session_id,
+                        user_question,
+                        None,
+                        answer,
+                        citations,
+                        user_tier,
+                        retrieval_tier,
+                        sentinel_reasoning,
+                        stop_event.is_set() or interrupted,
+                    )
+            except (Neo4jError, ServiceUnavailable) as exc:
+                # Answer was already generated; log and continue rather than raising.
+                print(
+                    f"[WARNING] Could not persist messages for session '{session_id}': {exc}"
+                )
+
+        # ── Step 6: Return response with answer and citations ──────────────────────────
+        return ChatResponse(
+            answer=answer,
+            citations=citations,
+            graph_nodes=graph_nodes,
+            graph_edges=graph_edges,
+            retrieval_tier=retrieval_tier,
+            sentinel_reasoning=sentinel_reasoning,
+            followup_suggestions=followup_suggestions,
         )
-        for p in active_context
-    ]
-    graph_nodes, graph_edges = _build_evidence_graph(active_context)
-
-    # ── Step 5: Persist the new turn to Neo4j with citations (non-fatal on failure) ──────────
-    try:
-        with driver.session() as neo4j_session:
-            neo4j_session.execute_write(
-                _save_messages_tx,
-                session_id,
-                user_question,
-                None,
-                answer,
-                citations,
-                user_tier,
-                retrieval_tier,
-                sentinel_reasoning,
-            )
-    except (Neo4jError, ServiceUnavailable) as exc:
-        # Answer was already generated; log and continue rather than raising.
-        print(
-            f"[WARNING] Could not persist messages for session '{session_id}': {exc}"
-        )
-
-    # ── Step 6: Return response with answer and citations ──────────────────────────
-    return ChatResponse(
-        answer=answer,
-        citations=citations,
-        graph_nodes=graph_nodes,
-        graph_edges=graph_edges,
-        retrieval_tier=retrieval_tier,
-        sentinel_reasoning=sentinel_reasoning,
-        followup_suggestions=followup_suggestions,
-    )
+    finally:
+        stop_event.set()
+        disconnect_task.cancel()
+        try:
+            await disconnect_task
+        except asyncio.CancelledError:
+            pass
 
 
 @app.post("/ingest", response_model=UploadResponse)

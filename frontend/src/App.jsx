@@ -33,6 +33,7 @@ import {
 // ── Constants ─────────────────────────────────────────────────────────────────
 
 const API_BASE = 'https://sentinel-hybridrag.onrender.com'
+const STRICT_NO_ANSWER = 'I cannot find a verified active policy for this in the current database.'
 
 // ── Utilities ─────────────────────────────────────────────────────────────────
 
@@ -114,6 +115,11 @@ function normalizeRetrievalTier(message) {
   if (rawTier === 'partial_match' || rawTier === 'partial') return 'partial'
   if (rawTier === 'no_match' || rawTier === 'no-match' || rawTier === 'none') return 'no_match'
   return ''
+}
+
+function isStrictNoAnswerMessage(message) {
+  const content = String(message?.content || '').trim()
+  return content === STRICT_NO_ANSWER || normalizeRetrievalTier(message) === 'no_match'
 }
 
 // ── Sub-components ────────────────────────────────────────────────────────────
@@ -281,6 +287,7 @@ function CitationsPanel({ citations, onOpenCitation }) {
 /** A single chat bubble (user or assistant). */
 function MessageBubble({ message, index, onAskSME, onOpenCitation }) {
   const isUser = message.role === 'user'
+  const suppressEvidence = !isUser && isStrictNoAnswerMessage(message)
 
   if (isUser) {
     return (
@@ -355,8 +362,10 @@ function MessageBubble({ message, index, onAskSME, onOpenCitation }) {
           </ReactMarkdown>
         </div>
 
-        <CitationsPanel citations={message.citations} onOpenCitation={onOpenCitation} />
-            {Array.isArray(message.followup_suggestions) && message.followup_suggestions.length > 0 ? (
+        {!suppressEvidence ? (
+          <CitationsPanel citations={message.citations} onOpenCitation={onOpenCitation} />
+        ) : null}
+            {!suppressEvidence && Array.isArray(message.followup_suggestions) && message.followup_suggestions.length > 0 ? (
               <div className="mt-3 rounded-2xl border border-blue-700/40 bg-blue-950/30 px-3 py-3">
                 <p className="text-[11px] uppercase tracking-[0.24em] text-blue-300">
                   Validated follow-ups
@@ -396,6 +405,31 @@ function PolicyRepositoryView({
   policyError,
   onOpenPolicy,
 }) {
+  const [query, setQuery] = useState('')
+
+  const normalize = (s) => (s || '').toLowerCase()
+
+  const filtered = policies.filter((p) => {
+    if (!query) return true
+    const q = normalize(query)
+    return normalize(p.file_name).includes(q) || normalize(p.path || '').includes(q)
+  })
+
+  const highlightMatch = (text) => {
+    if (!query) return text
+    const q = query.replace(/[.*+?^${}()|[\\]\\]/g, '\\$&')
+    const re = new RegExp(`(${q})`, 'ig')
+    return text.split(re).map((part, i) =>
+      re.test(part) ? (
+        <span key={i} className="bg-yellow-600/30 text-yellow-200 px-0.5 rounded">
+          {part}
+        </span>
+      ) : (
+        <span key={i}>{part}</span>
+      )
+    )
+  }
+
   return (
     <div className="h-full overflow-y-auto px-6 py-6">
       <div className="max-w-3xl mx-auto space-y-6">
@@ -407,17 +441,26 @@ function PolicyRepositoryView({
             <div>
               <h2 className="text-xl font-semibold text-gray-100">Policy Repository</h2>
               <p className="text-sm text-gray-400 mt-1 leading-relaxed">
-                Browse only the policy PDFs your access tier can view. Documents open through the secured API proxy.
+                Search and open policy documents. Visibility is enforced by backend access_code checks.
               </p>
             </div>
           </div>
 
-          <div className="text-xs text-gray-500">
-            Signed in as {employeeId}. Visibility is enforced by backend access_code checks.
-          </div>
+          <div className="text-xs text-gray-500">Signed in as {employeeId}.</div>
         </div>
 
         <div className="rounded-3xl border border-gray-700 bg-gray-800/70 backdrop-blur-sm p-4">
+          <div className="mb-3">
+            <label className="text-xs text-gray-400 mb-2 block">Search files</label>
+            <input
+              type="search"
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+              placeholder="Search by file name or path..."
+              className="w-full rounded-xl border border-gray-700 bg-gray-950/60 px-3 py-2 text-sm text-gray-100 outline-none placeholder:text-gray-500 focus:border-blue-500 focus:ring-2 focus:ring-blue-500/20"
+            />
+          </div>
+
           {isPoliciesLoading && (
             <div className="rounded-2xl border border-gray-700 bg-gray-900/70 px-4 py-3 text-sm text-gray-300">
               Loading authorized policies...
@@ -436,15 +479,22 @@ function PolicyRepositoryView({
             </div>
           )}
 
-          {!isPoliciesLoading && !policyError && policies.length > 0 && (
+          {!isPoliciesLoading && !policyError && filtered.length === 0 && policies.length > 0 && (
+            <div className="rounded-2xl border border-gray-700 bg-gray-900/70 px-4 py-3 text-sm text-gray-400">
+              No matches for "{query}". Try a different keyword.
+            </div>
+          )}
+
+          {!isPoliciesLoading && !policyError && filtered.length > 0 && (
             <div className="divide-y divide-gray-700">
-              {policies.map((item) => (
+              {filtered.map((item) => (
                 <div key={item.file_name} className="flex items-center justify-between gap-3 px-2 py-3">
                   <div>
-                    <p className="text-sm font-medium text-gray-100">{item.file_name}</p>
-                    <p className="text-xs text-gray-500 mt-0.5">
-                      {item.access_code === 1 ? 'Confidential (1)' : 'General (2)'}
+                    <p className="text-sm font-medium text-gray-100">
+                      {highlightMatch(item.file_name)}
                     </p>
+                    <p className="text-xs text-gray-500 mt-0.5">{item.access_code === 1 ? 'Confidential (1)' : 'General (2)'}</p>
+                    <p className="text-xs text-gray-400 mt-0.5">{highlightMatch(item.path || '')}</p>
                   </div>
                   <button
                     type="button"
@@ -452,7 +502,7 @@ function PolicyRepositoryView({
                     className="inline-flex items-center gap-1.5 rounded-xl border border-gray-600 px-3 py-1.5 text-xs text-gray-200 hover:border-blue-500 hover:text-blue-300 transition-colors"
                   >
                     <ExternalLink size={13} />
-                    Open PDF
+                    Open
                   </button>
                 </div>
               ))}
@@ -889,7 +939,12 @@ export default function App() {
           typeof msg.enhanced_prompt === 'string' && msg.enhanced_prompt.trim()
             ? msg.enhanced_prompt
             : null,
-        citations: Array.isArray(msg.citations) ? msg.citations : [],
+        citations:
+          isStrictNoAnswerMessage(msg) || normalizeRetrievalTier(msg) === 'no_match'
+            ? []
+            : Array.isArray(msg.citations)
+              ? msg.citations
+              : [],
         graph: normalizeGraphPayload(msg),
         retrieval_tier: normalizeRetrievalTier(msg),
       }))
@@ -1016,10 +1071,18 @@ export default function App() {
         const assistantMsg = {
           role: 'assistant',
           content: data.answer,
-          citations: data.citations ?? [],
+          citations:
+            String(data.answer || '').trim() === STRICT_NO_ANSWER || normalizeRetrievalTier(data) === 'no_match'
+              ? []
+              : data.citations ?? [],
           graph: normalizeGraphPayload(data),
           retrieval_tier: normalizeRetrievalTier(data),
-          followup_suggestions: Array.isArray(data.followup_suggestions) ? data.followup_suggestions : [],
+          followup_suggestions:
+            String(data.answer || '').trim() === STRICT_NO_ANSWER || normalizeRetrievalTier(data) === 'no_match'
+              ? []
+              : Array.isArray(data.followup_suggestions)
+                ? data.followup_suggestions
+                : [],
         }
         setMessages((prev) => [...prev, assistantMsg])
 

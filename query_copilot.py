@@ -100,6 +100,62 @@ STRICT_NO_ANSWER = (
 # Model: intfloat/multilingual-e5-small deployed on HF Spaces (mohan1201/sentinel-embedding-server)
 EMBEDDING_DIM = 384
 
+# High-value exposure thresholds (INR)
+HIGH_VALUE_EXPOSURE_THRESHOLD = 10_000_000  # ₹10 Crore
+
+
+def detect_high_value_exposure(text: str, threshold: int = HIGH_VALUE_EXPOSURE_THRESHOLD) -> List[Dict[str, Any]]:
+    """Detect high-value financial exposures (INR amounts > threshold) in text.
+    
+    Uses regex to extract currency amounts in INR and flags those exceeding
+    the configured threshold for executive-level risk flagging.
+    
+    Args:
+        text: Source text to scan for currency amounts (typically from active_context).
+        threshold: INR amount threshold for flagging (default: ₹10 Crore).
+    
+    Returns:
+        List[Dict]: Each dict contains {'amount': <float>, 'raw_text': <str>, 'risk_level': <str>}
+    """
+    import re
+    
+    if not text:
+        return []
+    
+    findings = []
+    
+    # Regex patterns for INR amounts with various formats
+    patterns = [
+        r'[₹]\s*([0-9,]+(?:\.[0-9]{2})?)',  # ₹ symbol
+        r'INR\s+([0-9,]+(?:\.[0-9]{2})?)',  # INR prefix
+        r'Rs\.?\s+([0-9,]+(?:\.[0-9]{2})?)',  # Rs. or Rs prefix
+        r'Cr(?:ore)?\s+([0-9,]+(?:\.[0-9]{2})?)',  # Crore amounts
+    ]
+    
+    for pattern in patterns:
+        matches = re.finditer(pattern, text, re.IGNORECASE)
+        for match in matches:
+            amount_str = match.group(1).replace(',', '')
+            try:
+                amount = float(amount_str)
+                
+                # Scale crore amounts to base INR
+                if 'crore' in match.group(0).lower() or 'cr' in match.group(0).lower():
+                    amount = amount * 10_000_000
+                
+                if amount >= threshold:
+                    risk_level = 'CRITICAL_TIER_1' if amount >= threshold else 'WARNING'
+                    findings.append({
+                        'amount': amount,
+                        'raw_text': match.group(0),
+                        'risk_level': risk_level,
+                        'position': match.start(),
+                    })
+            except (ValueError, TypeError):
+                continue
+    
+    return sorted(findings, key=lambda x: x['position'], reverse=True)  # Sort descending by position
+
 
 class ActivePolicy(BaseModel):
     """Verified active policy context returned from Neo4j retrieval."""
@@ -575,19 +631,34 @@ def generate_answer(
     active_context: Sequence[ActivePolicy],
     user_question: str,
     detected_language: str = "English",
+    retrieval_tier: str | None = None,
 ) -> str:
-    """Generate grounded response text from verified active policy context.
+    """Generate a grounded compliance answer from verified policy evidence.
 
     Args:
         llm: LLM client used for final answer generation.
         active_context: Active policy evidence retrieved from Neo4j.
         user_question: User's question text.
+        detected_language: Language name used to keep the response localized
+            for the operator.
+        retrieval_tier: Retrieval classification used to enforce the no-match
+            guardrail before synthesis.
 
     Returns:
-        str: Grounded answer text or strict no-answer fallback.
+        str: The grounded answer text, or the strict no-answer sentinel when
+        no verified policy context is available.
+
+    Audit Note:
+        The no-match path intentionally returns the strict sentinel instead of
+        a synthesized response. This prevents speculative evidence from being
+        emitted into the client flow and keeps GLAC-controlled retrieval
+        aligned with Stateful Auditability.
     """
 
-    if not active_context:
+    # SECURITY GUARDRAIL: A no-match retrieval tier must short-circuit before
+    # prompt construction so the model cannot invent policy evidence from an
+    # empty or unverified context.
+    if not active_context or (retrieval_tier or "").strip().lower() == "no_match":
         return STRICT_NO_ANSWER
 
     context_blocks = []
@@ -602,6 +673,17 @@ def generate_answer(
             )
         )
     context_text = "\n\n".join(context_blocks)
+    
+    # Detect high-value exposures (Executive Auditor: Tier-1 Risk Flagging)
+    high_value_findings = detect_high_value_exposure(context_text)
+    high_value_instruction = ""
+    if high_value_findings:
+        amounts_str = ", ".join(
+            f"**INR {finding['amount']:,.0f}** (Flagged: {finding['risk_level']})"
+            for finding in high_value_findings
+        )
+        high_value_instruction = f"\n\n⚠️ CRITICAL ALERT: High-value exposures detected in context: {amounts_str}\n" \
+                                "If these amounts are relevant to the user query, you MUST bold them prominently and flag as 'Critical Tier 1 Risk' in your response."
 
     prompt = PromptTemplate.from_template(
         """
@@ -620,11 +702,19 @@ rates, liquidity ratios/percentages, thresholds, fines, and durations. Use
 ONLY the provided `active_context` (which is in English) to derive facts; do
 NOT hallucinate, estimate, or invent values.
 
+[EXECUTIVE AUDITOR INSTRUCTION]:
+If you identify any financial exposure amounts exceeding ₹10 Crore (10,000,000 INR),
+you MUST:
+1. Bold the amount using **Amount** formatting
+2. Flag it as "**[CRITICAL TIER 1 RISK]**" in the response
+3. Include the source document name
+4. Preserve exact numeric formatting from the source
+
 If the context does not contain the requested fact, reply exactly:
 "I cannot find a verified active policy for this in the current database."
 
 When returning numbers, include the source document name/ID for each extracted
-fact and preserve the original numeric formatting (e.g., "8.35%", "INR 50,000").
+fact and preserve the original numeric formatting (e.g., "8.35%", "INR 50,000").{high_value_instruction}
 
 active_context:
 {active_context}
@@ -639,6 +729,7 @@ user_question:
             active_context=context_text,
             user_question=user_question,
             detected_language=detected_language,
+            high_value_instruction=high_value_instruction,
         )
         response = llm.invoke(formatted_prompt)
         return str(response.content).strip()
